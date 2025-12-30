@@ -68,6 +68,7 @@ VERSION_MINOR="0"
 REPO_PAGE_SIZE=10
 EXTRA_PAGE_SIZE=50
 BATCH_SIZE=1                                  # Number of repos to process in parallel (1 = sequential)
+REPOS_TO_PROCESS=()                           # Global array to accumulate repos for batch processing
 
 ################################################################################
 #### Function PrintUsage #######################################################
@@ -779,6 +780,11 @@ GetRepos() {
       # We have all the data, we can move on
       echo "Gathered all repositories for org: ${ORG_NAME}"
       REPO_NEXT_PAGE=""
+      # Process any remaining repos that haven't been processed yet
+      if [[ ${#REPOS_TO_PROCESS[@]} -gt 0 ]]; then
+        ProcessReposInBatches
+        REPOS_TO_PROCESS=()
+      fi
     elif [ "${HAS_NEXT_PAGE}" == "true" ]; then
       # We need to loop through GitHub to get all repos
       Debug "More pages of repos, gathering next batch"
@@ -811,9 +817,6 @@ ParseRepos() {
   PARSE_DATA=$1
 
   REPOS=$(echo "${PARSE_DATA}" | jq -r '.data.organization.repositories.nodes')
-  
-  # Array to hold repos that need processing
-  REPOS_TO_PROCESS=()
   
   for REPO_DATA in $(echo -n "${REPOS}" | jq -r '.[] | @base64'); do
     _jq() {
@@ -854,16 +857,20 @@ ParseRepos() {
         # Found this in the csv already
         echo "Repo:[${OWNER}/${REPO_NAME}] has previously been analyzed, moving on..."
       elif [ ${ERROR_CODE} -ne 0 ] && [[ -z "${REPO_LIST_FILE}" ]]; then
-        # Add to processing list
+        # Add to global processing list
         REPOS_TO_PROCESS+=("${REPO_DATA}")
       fi
     fi
   done
 
   #####################################
-  # Process repos in batches          #
+  # Process repos when batch is full  #
   #####################################
-  ProcessReposInBatches
+  if [[ ${#REPOS_TO_PROCESS[@]} -ge ${BATCH_SIZE} ]]; then
+    ProcessReposInBatches
+    # Clear the array after processing
+    REPOS_TO_PROCESS=()
+  fi
 }
 ################################################################################
 #### Function ProcessReposInBatches ############################################
