@@ -67,6 +67,8 @@ VERSION_MAJOR="0"
 VERSION_MINOR="0"
 REPO_PAGE_SIZE=10
 EXTRA_PAGE_SIZE=50
+BATCH_SIZE=1                                  # Number of repos to process in parallel (1 = sequential)
+REPOS_TO_PROCESS=()                           # Global array to accumulate repos for batch processing
 
 ################################################################################
 #### Function PrintUsage #######################################################
@@ -76,6 +78,8 @@ PrintUsage()
 Usage: gh repo-stats [options]
 
 Options:
+     -b, --batch                   : Number of repositories to process in parallel
+                                     Default: $BATCH_SIZE (sequential processing)
      -d, --debug                   : Enable Debug logging
      -e, --extra-page-size         : Set the pagination size for subsequent, paginated GraphQL queries; reduce if timeout occurs
                                      Default: $EXTRA_PAGE_SIZE
@@ -105,6 +109,7 @@ Description:
 Example:
   gh repo-stats -o my-org-name
   gh repo-stats -o my-org-name -H github.example.com
+  gh repo-stats -o my-org-name -b 5   # Process 5 repos in parallel
 
 EOM
   exit 0
@@ -120,6 +125,10 @@ while (( "$#" )); do
       ;;
     -H|--hostname)
       export GH_HOST=$2
+      shift 2
+      ;;
+    -b|--batch)
+      BATCH_SIZE=$2
       shift 2
       ;;
     -d|--debug)
@@ -771,6 +780,11 @@ GetRepos() {
       # We have all the data, we can move on
       echo "Gathered all repositories for org: ${ORG_NAME}"
       REPO_NEXT_PAGE=""
+      # Process any remaining repos that haven't been processed yet
+      if [[ ${#REPOS_TO_PROCESS[@]} -gt 0 ]]; then
+        ProcessReposInBatches
+        REPOS_TO_PROCESS=()
+      fi
     elif [ "${HAS_NEXT_PAGE}" == "true" ]; then
       # We need to loop through GitHub to get all repos
       Debug "More pages of repos, gathering next batch"
@@ -803,6 +817,7 @@ ParseRepos() {
   PARSE_DATA=$1
 
   REPOS=$(echo "${PARSE_DATA}" | jq -r '.data.organization.repositories.nodes')
+  
   for REPO_DATA in $(echo -n "${REPOS}" | jq -r '.[] | @base64'); do
     _jq() {
     echo -n "${REPO_DATA}" | base64 --decode | jq -r "${1}"
@@ -820,8 +835,8 @@ ParseRepos() {
       # Check if the repo name is in the list
       for REPO in "${REPO_LIST_ARRAY[@]}"; do
         if [[ "${REPO}" == "${CHECK_REPO_NAME}" ]]; then
-          # Found a match, we can continue
-          ParseRepoData "${REPO_DATA}"
+          # Found a match, add to processing list
+          REPOS_TO_PROCESS+=("${REPO_DATA}")
         fi
       done
     else
@@ -842,11 +857,203 @@ ParseRepos() {
         # Found this in the csv already
         echo "Repo:[${OWNER}/${REPO_NAME}] has previously been analyzed, moving on..."
       elif [ ${ERROR_CODE} -ne 0 ] && [[ -z "${REPO_LIST_FILE}" ]]; then
-        echo "Analyzing Repo: ${REPO_NAME}"
-        ParseRepoData "${REPO_DATA}"
+        # Add to global processing list
+        REPOS_TO_PROCESS+=("${REPO_DATA}")
       fi
     fi
   done
+
+  #####################################
+  # Process repos when batch is full  #
+  #####################################
+  if [[ ${#REPOS_TO_PROCESS[@]} -ge ${BATCH_SIZE} ]]; then
+    ProcessReposInBatches
+    # Clear the array after processing
+    REPOS_TO_PROCESS=()
+  fi
+}
+################################################################################
+#### Function ProcessReposInBatches ############################################
+ProcessReposInBatches() {
+  TOTAL_REPOS=${#REPOS_TO_PROCESS[@]}
+  
+  if [[ ${TOTAL_REPOS} -eq 0 ]]; then
+    Debug "No repos to process in this batch"
+    return
+  fi
+
+  Debug "Processing ${TOTAL_REPOS} repos with batch size ${BATCH_SIZE}"
+
+  if [[ ${BATCH_SIZE} -le 1 ]]; then
+    #####################################
+    # Sequential processing (default)   #
+    #####################################
+    for REPO_DATA in "${REPOS_TO_PROCESS[@]}"; do
+      _jq() {
+        echo -n "${REPO_DATA}" | base64 --decode | jq -r "${1}"
+      }
+      REPO_NAME=$(_jq '.name' | tr '[:upper:]' '[:lower:]')
+      echo "Analyzing Repo: ${REPO_NAME}"
+      ParseRepoData "${REPO_DATA}"
+    done
+  else
+    #####################################
+    # Parallel batch processing         #
+    #####################################
+    echo "Processing repos in parallel batches of ${BATCH_SIZE}..."
+    
+    CURRENT_BATCH=0
+    PIDS=()
+    TEMP_DIR=$(mktemp -d)
+    
+    for i in "${!REPOS_TO_PROCESS[@]}"; do
+      REPO_DATA="${REPOS_TO_PROCESS[$i]}"
+      _jq() {
+        echo -n "${REPO_DATA}" | base64 --decode | jq -r "${1}"
+      }
+      REPO_NAME=$(_jq '.name' | tr '[:upper:]' '[:lower:]')
+      
+      echo "Starting analysis for Repo: ${REPO_NAME} (batch job $((CURRENT_BATCH + 1)))"
+      
+      # Run ParseRepoData in background, writing output to temp file
+      (
+        ParseRepoDataBatch "${REPO_DATA}" "${TEMP_DIR}/repo_${i}.csv"
+      ) &
+      
+      PIDS+=($!)
+      ((CURRENT_BATCH++))
+      
+      # Wait for batch to complete when we hit batch size
+      if [[ ${CURRENT_BATCH} -ge ${BATCH_SIZE} ]]; then
+        Debug "Waiting for batch of ${CURRENT_BATCH} jobs to complete..."
+        for PID in "${PIDS[@]}"; do
+          wait "${PID}"
+        done
+        PIDS=()
+        CURRENT_BATCH=0
+        
+        # Merge temp files into main output
+        for TEMP_FILE in "${TEMP_DIR}"/repo_*.csv; do
+          if [[ -f "${TEMP_FILE}" ]]; then
+            cat "${TEMP_FILE}" >> "${OUTPUT_FILE_NAME}"
+            rm -f "${TEMP_FILE}"
+          fi
+        done
+        
+        # Check API limits between batches
+        CheckAPILimit
+      fi
+    done
+    
+    # Wait for remaining jobs
+    if [[ ${#PIDS[@]} -gt 0 ]]; then
+      Debug "Waiting for final batch of ${#PIDS[@]} jobs to complete..."
+      for PID in "${PIDS[@]}"; do
+        wait "${PID}"
+      done
+      
+      # Merge remaining temp files
+      for TEMP_FILE in "${TEMP_DIR}"/repo_*.csv; do
+        if [[ -f "${TEMP_FILE}" ]]; then
+          cat "${TEMP_FILE}" >> "${OUTPUT_FILE_NAME}"
+          rm -f "${TEMP_FILE}"
+        fi
+      done
+    fi
+    
+    # Cleanup temp directory
+    rm -rf "${TEMP_DIR}"
+  fi
+}
+################################################################################
+#### Function ParseRepoDataBatch ###############################################
+# Batch version of ParseRepoData that writes to a temp file instead of directly
+# to OUTPUT_FILE_NAME to avoid race conditions in parallel processing
+ParseRepoDataBatch() {
+  REPO_DATA=$1
+  TEMP_OUTPUT_FILE=$2
+  
+  # Convert the format to JSON
+  _jq() {
+    echo -n "${REPO_DATA}" | base64 --decode | jq -r "${1}"
+  }
+
+  OWNER=$(_jq '.owner.login' | tr '[:upper:]' '[:lower:]')
+  REPO_NAME=$(_jq '.name' | tr '[:upper:]' '[:lower:]')
+  REPO_SIZE_KB=$(_jq '.diskUsage')
+  REPO_SIZE=$(ConvertKBToMB "${REPO_SIZE_KB}")
+
+  # Look for isEmpty property only if it's supported
+  IS_EMPTY="";
+  if [[ "$(isCompatibleGHESVersion)" -eq "1" ]]; then
+    IS_EMPTY="$(_jq '.isEmpty'),"
+  fi
+
+  CREATED_AT=$(_jq '.createdAt')
+  PUSHED_AT=$(_jq '.pushedAt')
+  UPDATED_AT=$(_jq '.updatedAt')
+  HAS_WIKI=$(_jq '.hasWikiEnabled')
+  IS_FORK=$(_jq '.isFork')
+  IS_ARCHIVED=$(_jq '.isArchived')
+  URL=$(_jq '.url')
+
+  MILESTONE_CT=$(_jq '.milestones.totalCount')
+  COLLABORATOR_CT=$(_jq '.collaborators.totalCount')
+  PR_CT=$(_jq '.pullRequests.totalCount')
+  ISSUE_CT=$(_jq '.issues.totalCount')
+  RELEASE_CT=$(_jq '.releases.totalCount')
+  COMMIT_COMMENT_CT=$(_jq '.commitComments.totalCount')
+  PROJECT_CT=$(_jq '.projects.totalCount')
+  BRANCH_CT=$(_jq '.branches.totalCount')
+  TAG_CT=$(_jq '.tags.totalCount')
+  DISCUSSION_CT=$(_jq '.discussions.totalCount')
+
+  if [[ "${VERSION}" == "cloud" ]]; then
+    PROTECTED_BRANCH_CT=$(_jq '.branchProtectionRules.totalCount')
+  else
+    PROTECTED_BRANCH_CT=$(_jq '.protectedBranches.totalCount')
+  fi
+
+  ISSUE_EVENT_CT=0
+  ISSUE_COMMENT_CT=0
+  PR_REVIEW_CT=0
+  PR_REVIEW_COMMENT_CT=0
+
+  ##################
+  # Analyze Issues #
+  ##################
+  if [[ $ISSUE_CT -ne 0 ]]; then
+    AnalyzeIssues "${REPO_DATA}"
+  fi
+
+  #########################
+  # Analyze Pull Requests #
+  #########################
+  if [[ $PR_CT -ne 0 ]]; then
+    AnalyzePullRequests "${REPO_DATA}"
+  fi
+
+  ###########################
+  # Build the output string #
+  ###########################
+  RECORD_CT=$((COLLABORATOR_CT + PROTECTED_BRANCH_CT + PR_REVIEW_CT + MILESTONE_CT + ISSUE_CT + PR_CT + PR_REVIEW_COMMENT_CT + COMMIT_COMMENT_CT + ISSUE_COMMENT_CT + ISSUE_EVENT_CT + RELEASE_CT + PROJECT_CT))
+
+  ####################################
+  # Get if this is a migration issue #
+  ####################################
+  MIGRATION_ISSUE=$(MarkMigrationIssues "${REPO_SIZE}" "${RECORD_CT}")
+  if [ "${MIGRATION_ISSUE}" -eq 0 ]; then
+    MIGRATION_ISSUE="TRUE"
+  else
+    MIGRATION_ISSUE="FALSE"
+  fi
+  
+  ########################
+  # Write to temp file   #
+  ########################
+  echo "${ORG_NAME},${REPO_NAME},${IS_EMPTY}${PUSHED_AT},${UPDATED_AT},${IS_FORK},${IS_ARCHIVED},${REPO_SIZE},${RECORD_CT},${COLLABORATOR_CT},${PROTECTED_BRANCH_CT},${PR_REVIEW_CT},${MILESTONE_CT},${ISSUE_CT},${PR_CT},${PR_REVIEW_COMMENT_CT},${COMMIT_COMMENT_CT},${ISSUE_COMMENT_CT},${ISSUE_EVENT_CT},${RELEASE_CT},${PROJECT_CT},${BRANCH_CT},${TAG_CT},${DISCUSSION_CT},${HAS_WIKI},${URL},${MIGRATION_ISSUE},${CREATED_AT}" > "${TEMP_OUTPUT_FILE}"
+  
+  echo "Completed analysis for Repo: ${REPO_NAME}"
 }
 ################################################################################
 #### Function ParseRepoData ####################################################
