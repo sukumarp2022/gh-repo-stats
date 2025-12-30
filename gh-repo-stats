@@ -16,6 +16,10 @@
 # If empty
 # Last push
 # Last commit
+# Latest Commit SHA (most recent commit across all branches)
+# Latest Committed At (timestamp of the most recent commit)
+# Latest Commit Branch (branch name where the latest commit was made)
+# Default Branch (default branch of the repo, or "No default branch")
 # isFork
 # isArchived
 # Size(mb)
@@ -446,7 +450,7 @@ GenerateFiles() {
       IS_EMPTY_HEADER="";
     fi
 
-    echo "Org_Name,Repo_Name,${IS_EMPTY_HEADER}Last_Push,Last_Update,isFork,isArchived,Repo_Size(mb),Record_Count,Collaborator_Count,Protected_Branch_Count,PR_Review_Count,Milestone_Count,Issue_Count,PR_Count,PR_Review_Comment_Count,Commit_Comment_Count,Issue_Comment_Count,Issue_Event_Count,Release_Count,Project_Count,Branch_Count,Tag_Count,Discussion_Count,Has_Wiki,Full_URL,Migration_Issue,Created" >>"${OUTPUT_FILE_NAME}" 2>&1
+    echo "Org_Name,Repo_Name,${IS_EMPTY_HEADER}Last_Push,Last_Update,Latest_Commit_SHA,Latest_Committed_At,Latest_Commit_Branch,Default_Branch,isFork,isArchived,Repo_Size(mb),Record_Count,Collaborator_Count,Protected_Branch_Count,PR_Review_Count,Milestone_Count,Issue_Count,PR_Count,PR_Review_Comment_Count,Commit_Comment_Count,Issue_Comment_Count,Issue_Event_Count,Release_Count,Project_Count,Branch_Count,Tag_Count,Discussion_Count,Has_Wiki,Full_URL,Migration_Issue,Created" >>"${OUTPUT_FILE_NAME}" 2>&1
 
     #######################
     # Load the error code #
@@ -647,6 +651,17 @@ GetRepos() {
           branches: refs(refPrefix:\"refs/heads/\") {
             totalCount
           }
+          allBranches: refs(refPrefix: \"refs/heads/\", first: 100) {
+            nodes {
+              name
+              target {
+                ... on Commit {
+                  oid
+                  committedDate
+                }
+              }
+            }
+          }
           branchProtectionRules {
             totalCount
           }
@@ -722,6 +737,9 @@ GetRepos() {
             }
           }
           pushedAt
+          defaultBranchRef {
+            name
+          }
           releases {
             totalCount
           }
@@ -1008,6 +1026,29 @@ ParseRepoDataBatch() {
   TAG_CT=$(_jq '.tags.totalCount')
   DISCUSSION_CT=$(_jq '.discussions.totalCount')
 
+  #############################################
+  # Get latest commit SHA and timestamp       #
+  # across all branches by sorting commits    #
+  #############################################
+  LATEST_COMMIT_DATA=$(echo -n "${REPO_DATA}" | base64 --decode | jq -r '[.allBranches.nodes[] | select(.target.committedDate != null)] | sort_by(.target.committedDate) | reverse | .[0]')
+  if [[ -n "${LATEST_COMMIT_DATA}" && "${LATEST_COMMIT_DATA}" != "null" ]]; then
+    LATEST_COMMIT_SHA=$(echo "${LATEST_COMMIT_DATA}" | jq -r '.target.oid // empty')
+    LATEST_COMMITTED_AT=$(echo "${LATEST_COMMIT_DATA}" | jq -r '.target.committedDate // empty')
+    LATEST_COMMIT_BRANCH=$(echo "${LATEST_COMMIT_DATA}" | jq -r '.name // empty')
+  else
+    LATEST_COMMIT_SHA=""
+    LATEST_COMMITTED_AT=""
+    LATEST_COMMIT_BRANCH=""
+  fi
+
+  #############################################
+  # Get default branch name                   #
+  #############################################
+  DEFAULT_BRANCH=$(_jq '.defaultBranchRef.name // empty')
+  if [[ -z "${DEFAULT_BRANCH}" ]]; then
+    DEFAULT_BRANCH="No default branch"
+  fi
+
   if [[ "${VERSION}" == "cloud" ]]; then
     PROTECTED_BRANCH_CT=$(_jq '.branchProtectionRules.totalCount')
   else
@@ -1051,7 +1092,7 @@ ParseRepoDataBatch() {
   ########################
   # Write to temp file   #
   ########################
-  echo "${ORG_NAME},${REPO_NAME},${IS_EMPTY}${PUSHED_AT},${UPDATED_AT},${IS_FORK},${IS_ARCHIVED},${REPO_SIZE},${RECORD_CT},${COLLABORATOR_CT},${PROTECTED_BRANCH_CT},${PR_REVIEW_CT},${MILESTONE_CT},${ISSUE_CT},${PR_CT},${PR_REVIEW_COMMENT_CT},${COMMIT_COMMENT_CT},${ISSUE_COMMENT_CT},${ISSUE_EVENT_CT},${RELEASE_CT},${PROJECT_CT},${BRANCH_CT},${TAG_CT},${DISCUSSION_CT},${HAS_WIKI},${URL},${MIGRATION_ISSUE},${CREATED_AT}" > "${TEMP_OUTPUT_FILE}"
+  echo "${ORG_NAME},${REPO_NAME},${IS_EMPTY}${PUSHED_AT},${UPDATED_AT},${LATEST_COMMIT_SHA},${LATEST_COMMITTED_AT},${LATEST_COMMIT_BRANCH},${DEFAULT_BRANCH},${IS_FORK},${IS_ARCHIVED},${REPO_SIZE},${RECORD_CT},${COLLABORATOR_CT},${PROTECTED_BRANCH_CT},${PR_REVIEW_CT},${MILESTONE_CT},${ISSUE_CT},${PR_CT},${PR_REVIEW_COMMENT_CT},${COMMIT_COMMENT_CT},${ISSUE_COMMENT_CT},${ISSUE_EVENT_CT},${RELEASE_CT},${PROJECT_CT},${BRANCH_CT},${TAG_CT},${DISCUSSION_CT},${HAS_WIKI},${URL},${MIGRATION_ISSUE},${CREATED_AT}" > "${TEMP_OUTPUT_FILE}"
   
   echo "Completed analysis for Repo: ${REPO_NAME}"
 }
@@ -1095,6 +1136,29 @@ ParseRepoData() {
   TAG_CT=$(_jq '.tags.totalCount')
   DISCUSSION_CT=$(_jq '.discussions.totalCount')
 
+  #############################################
+  # Get latest commit SHA and timestamp       #
+  # across all branches by sorting commits    #
+  #############################################
+  LATEST_COMMIT_DATA=$(echo -n "${REPO_DATA}" | base64 --decode | jq -r '[.allBranches.nodes[] | select(.target.committedDate != null)] | sort_by(.target.committedDate) | reverse | .[0]')
+  if [[ -n "${LATEST_COMMIT_DATA}" && "${LATEST_COMMIT_DATA}" != "null" ]]; then
+    LATEST_COMMIT_SHA=$(echo "${LATEST_COMMIT_DATA}" | jq -r '.target.oid // empty')
+    LATEST_COMMITTED_AT=$(echo "${LATEST_COMMIT_DATA}" | jq -r '.target.committedDate // empty')
+    LATEST_COMMIT_BRANCH=$(echo "${LATEST_COMMIT_DATA}" | jq -r '.name // empty')
+  else
+    LATEST_COMMIT_SHA=""
+    LATEST_COMMITTED_AT=""
+    LATEST_COMMIT_BRANCH=""
+  fi
+
+  #############################################
+  # Get default branch name                   #
+  #############################################
+  DEFAULT_BRANCH=$(_jq '.defaultBranchRef.name // empty')
+  if [[ -z "${DEFAULT_BRANCH}" ]]; then
+    DEFAULT_BRANCH="No default branch"
+  fi
+
   if [[ "${VERSION}" == "cloud" ]]; then
     PROTECTED_BRANCH_CT=$(_jq '.branchProtectionRules.totalCount')
   else
@@ -1137,7 +1201,7 @@ ParseRepoData() {
   ########################
   # Write it to the file #
   ########################
-  echo "${ORG_NAME},${REPO_NAME},${IS_EMPTY}${PUSHED_AT},${UPDATED_AT},${IS_FORK},${IS_ARCHIVED},${REPO_SIZE},${RECORD_CT},${COLLABORATOR_CT},${PROTECTED_BRANCH_CT},${PR_REVIEW_CT},${MILESTONE_CT},${ISSUE_CT},${PR_CT},${PR_REVIEW_COMMENT_CT},${COMMIT_COMMENT_CT},${ISSUE_COMMENT_CT},${ISSUE_EVENT_CT},${RELEASE_CT},${PROJECT_CT},${BRANCH_CT},${TAG_CT},${DISCUSSION_CT},${HAS_WIKI},${URL},${MIGRATION_ISSUE},${CREATED_AT}" >>"${OUTPUT_FILE_NAME}"
+  echo "${ORG_NAME},${REPO_NAME},${IS_EMPTY}${PUSHED_AT},${UPDATED_AT},${LATEST_COMMIT_SHA},${LATEST_COMMITTED_AT},${LATEST_COMMIT_BRANCH},${DEFAULT_BRANCH},${IS_FORK},${IS_ARCHIVED},${REPO_SIZE},${RECORD_CT},${COLLABORATOR_CT},${PROTECTED_BRANCH_CT},${PR_REVIEW_CT},${MILESTONE_CT},${ISSUE_CT},${PR_CT},${PR_REVIEW_COMMENT_CT},${COMMIT_COMMENT_CT},${ISSUE_COMMENT_CT},${ISSUE_EVENT_CT},${RELEASE_CT},${PROJECT_CT},${BRANCH_CT},${TAG_CT},${DISCUSSION_CT},${HAS_WIKI},${URL},${MIGRATION_ISSUE},${CREATED_AT}" >>"${OUTPUT_FILE_NAME}"
 
   #######################
   # Load the error code #
